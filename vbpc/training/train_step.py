@@ -1,0 +1,303 @@
+"""JIT-compiled VBPC training steps.
+
+One VBPC step performs the two stages required by the proposal:
+
+1. **Latent inference** -- draw one reparameterized weight sample
+   ``W = mu_W + sigma_W * eps`` and optimize ``q(z_l | x)`` with Adam on the
+   *local PC energy only* (``L_PC``); the weight KL term is excluded here.
+2. **Weight/variational-parameter learning** -- freeze the inferred latents
+   (``stop_gradient``), sample ``z`` from the frozen ``q(z_l | x)`` and take an
+   Adam step on ``L_total = L_PC + beta * L_KL`` with respect to
+   ``(mu_W, log_sigma_W)``, reusing the *same* weight epsilon so that the step is
+   a proper single-sample reparameterized gradient estimate of ``E_q[L_PC]``.
+"""
+
+from __future__ import annotations
+
+from typing import Any, NamedTuple, Optional, Tuple
+
+import jax
+import jax.numpy as jnp
+
+from bpc.config import DTYPE, Array
+from vbpc.config import VBPCConfig
+from vbpc.inference.latent_inference import (
+    VBPCLatentDiagnostics,
+    vbpc_latent_inference,
+)
+from vbpc.inference.objectives import (
+    VBPCStates,
+    clamped_states,
+    pc_energy,
+    reparameterize_states,
+    sample_state_epsilons,
+)
+from vbpc.optim import VBPCOptimizer, make_optimizer
+from vbpc.posterior.weight_posterior import (
+    VBPCWeightParams,
+    mean_weight_variance,
+    reparameterize_weight_matrices,
+    sample_weight_epsilons,
+    weight_kl,
+    weight_kl_grads,
+)
+
+
+class VBPCDiagnostics(NamedTuple):
+    """Per-step VBPC diagnostics written to the batch logs."""
+
+    pc_energy: Array
+    weight_kl: Array
+    total_loss: Array
+    mean_weight_variance: Array
+    beta: Array
+    eps_norm: Array
+    latent_energy_init: Array
+    latent_energy_final: Array
+    latent_grad_norm_init: Array
+    latent_grad_norm_final: Array
+    latent_sigma_mean_final: Array
+    #: ``||grad_{mu_W} L_PC||`` -- the data term's contribution, in isolation.
+    pc_grad_norm: Array
+    #: ``||grad_{mu_W} (beta * L_KL)||`` -- the prior's contribution, in isolation.
+    kl_grad_norm: Array
+    #: ``kl_grad_norm / (pc_grad_norm + kl_grad_norm)``, the relative magnitude of
+    #: the prior's contribution to the weight-mean gradient.  ``0`` means ``beta``
+    #: is doing nothing, ``~0.5`` means the two terms are in parity, ``~1`` means
+    #: the prior dominates the update (and the weight means will collapse).
+    kl_grad_share: Array
+    #: Signed mean of ``dL_KL/dlog_sigma_W`` over all weight entries, at the
+    #: pre-update parameters.  A large negative value means the prior is actively
+    #: inflating the sampled weight noise; it is ~0 when
+    #: ``prior_weight_log_sigma == init_weight_log_sigma`` and ~-0.11 (per
+    #: ``"mean"`` reduction) under the proposal's unit prior.
+    kl_log_sigma_grad: Array
+
+
+def resolve_beta(cfg: VBPCConfig, beta: Optional[Array]) -> Array:
+    """Beta as an array, defaulting to ``cfg.beta``."""
+
+    return jnp.asarray(cfg.beta if beta is None else beta, dtype=DTYPE)
+
+
+def sample_weights_and_latents(
+    weight_params: Tuple[VBPCWeightParams, ...],
+    layer_dims: Tuple[int, ...],
+    xb: Array,
+    yb: Array,
+    cfg: VBPCConfig,
+    key: Array,
+) -> Tuple[Tuple[Array, ...], Tuple[Array, ...], VBPCStates, VBPCLatentDiagnostics]:
+    """One weight sample plus latent inference on ``L_PC`` for a batch."""
+
+    key_w, key_latent = jax.random.split(key)
+    epsilons = sample_weight_epsilons(weight_params, key_w)
+    weights = reparameterize_weight_matrices(
+        weight_params, epsilons, cfg.weight_sigma_min, cfg.weight_sigma_max
+    )
+    latents, latent_diag = vbpc_latent_inference(
+        weight_params, layer_dims, weights, xb, yb, cfg, key_latent
+    )
+    return weights, epsilons, latents, latent_diag
+
+
+def vbpc_loss_and_grads(
+    cfg: VBPCConfig,
+    layer_dims: Tuple[int, ...],
+    weight_params: Tuple[VBPCWeightParams, ...],
+    xb: Array,
+    yb: Array,
+    key: Array,
+    beta: Optional[Array] = None,
+) -> Tuple[Array, Tuple[Array, Array], Any, VBPCStates, VBPCLatentDiagnostics, Tuple[Array, ...], Any]:
+    """``L_total``, its two terms, gradients and the inferred latents for one batch.
+
+    When ``cfg.n_weight_samples > 1``, draws that many independent weight epsilon
+    samples, averages their ``L_PC`` gradients (and values), then adds a single
+    ``L_KL`` term.  Latent inference uses the first weight sample only.
+    """
+
+    n = int(cfg.n_weight_samples)
+    # Latent inference always uses the first weight sample.
+    #
+    # The split count is deliberately ``n + 2``, not ``n + 1``: this is the
+    # exact estimator of the verified-good VBPC baseline (the runs that reach
+    # 85-91% MNIST accuracy and ~90% two-moons).  It yields ``n + 1`` weight
+    # epsilon samples for the ``L_PC`` average scaled by ``1/n``.  Reducing the
+    # split to ``n + 1`` (a "correct" sample count) was tried in 9c8ce1c and
+    # silently regressed training: with a single ``L_PC`` sample the data-term
+    # gradient is too weak/noisy relative to ``beta * dL_KL/dmu`` (the matched
+    # prior still pulls mu toward zero with strength ``beta * mu / tau^2``,
+    # ``tau = exp(-3)``), so the weight means collapse to zero, predictions go
+    # uniform and the NLL stalls at ln(10) ~= 2.303.  Keep this bit-compatible
+    # with the original implementation; see tests/test_latent_prior_ablation.py.
+    key_w0, key_latent, *keys_extra = jax.random.split(key, n + 2)
+    epsilons = sample_weight_epsilons(weight_params, key_w0)
+    weights = reparameterize_weight_matrices(
+        weight_params, epsilons, cfg.weight_sigma_min, cfg.weight_sigma_max
+    )
+    latents, latent_diag = vbpc_latent_inference(
+        weight_params, layer_dims, weights, xb, yb, cfg, key_latent
+    )
+    frozen = jax.lax.stop_gradient(latents)
+    eps_states = sample_state_epsilons(frozen, jax.random.fold_in(key, 1))
+    beta_value = resolve_beta(cfg, beta)
+
+    def kl_only(params):
+        return weight_kl(
+            params, cfg.kl_reduction, cfg.weight_sigma_min, cfg.weight_sigma_max,
+            cfg.prior_weight_log_sigma,
+        )
+
+    def pc_loss_fn(params, eps_w):
+        """``L_PC`` for one weight epsilon sample (no KL)."""
+        sampled_weights = reparameterize_weight_matrices(
+            params, eps_w, cfg.weight_sigma_min, cfg.weight_sigma_max
+        )
+        hidden = reparameterize_states(
+            frozen, eps_states, cfg.state_sigma_min, cfg.state_sigma_max
+        )
+        return pc_energy(clamped_states(hidden, xb, yb), sampled_weights, cfg)
+
+    # First sample (already drawn for latent inference).
+    l_pc_0, pc_grads_0 = jax.value_and_grad(pc_loss_fn)(weight_params, epsilons)
+    l_pc_acc = l_pc_0
+    pc_grads_acc = pc_grads_0
+
+    # Additional samples averaged in.
+    for i, key_wi in enumerate(keys_extra):
+        eps_i = sample_weight_epsilons(weight_params, key_wi)
+        l_pc_i, pc_grads_i = jax.value_and_grad(pc_loss_fn)(weight_params, eps_i)
+        l_pc_acc = l_pc_acc + l_pc_i
+        pc_grads_acc = jax.tree.map(lambda a, b: a + b, pc_grads_acc, pc_grads_i)
+
+    scale = jnp.asarray(1.0 / n, dtype=DTYPE)
+    l_pc = l_pc_acc * scale
+    pc_grads = jax.tree.map(lambda g: g * scale, pc_grads_acc)
+
+    l_kl = kl_only(weight_params)
+    total = l_pc + beta_value * l_kl
+    kl_grads = weight_kl_grads(
+        weight_params, cfg.kl_reduction, cfg.weight_sigma_min, cfg.weight_sigma_max,
+        cfg.prior_weight_log_sigma,
+    )
+    grads = jax.tree.map(lambda p, k: p + beta_value * k, pc_grads, kl_grads)
+    return total, (l_pc, l_kl), grads, latents, latent_diag, epsilons, kl_grads
+
+
+def _grad_norm(grads: Any, field: str) -> Array:
+    """L2 norm over every leaf of a ``VBPCWeightParams`` gradient tree."""
+
+    return jnp.sqrt(
+        sum(
+            (jnp.sum(getattr(g, field) ** 2) for g in grads),
+            jnp.asarray(0.0, dtype=DTYPE),
+        )
+    )
+
+
+def build_step_diagnostics(
+    cfg: VBPCConfig,
+    new_params: Tuple[VBPCWeightParams, ...],
+    terms: Tuple[Array, Array],
+    total: Array,
+    latent_diag: VBPCLatentDiagnostics,
+    epsilons: Tuple[Array, ...],
+    beta: Array,
+    total_grads: Any,
+    kl_grads: Any,
+) -> VBPCDiagnostics:
+    """Bundle the per-step diagnostics."""
+
+    l_pc, l_kl = terms
+    eps_norm = jnp.sqrt(
+        sum((jnp.sum(e * e) for e in epsilons), jnp.asarray(0.0, dtype=DTYPE))
+    )
+    # grad(L_total) = grad(L_PC) + beta * grad(L_KL) exactly, so subtracting the
+    # prior's contribution tree-wise recovers grad(L_PC) without a second backward
+    # pass through the (expensive) PC graph.  Subtracting norms instead would be
+    # wrong: it can go negative when the two gradients largely cancel.
+    pc_grads = jax.tree.map(lambda g, k: g - beta * k, total_grads, kl_grads)
+    pc_grad_norm = _grad_norm(pc_grads, "mu")
+    kl_grad_norm = beta * _grad_norm(kl_grads, "mu")
+    # Relative magnitude of the prior's contribution, bounded in [0, 1] and
+    # monotone in beta.  (Dividing by ||grad(L_total)|| instead would be the
+    # "share of the realised update", but the two gradients can partially cancel,
+    # which can push that ratio above 1 and makes it a poor inertness indicator.)
+    kl_grad_share = kl_grad_norm / jnp.maximum(
+        pc_grad_norm + kl_grad_norm, jnp.asarray(1e-30, dtype=DTYPE)
+    )
+    # dL_KL/dlog_sigma_W, unweighted by beta, to expose prior/init mismatch.  This
+    # is a *signed mean* over all entries, not a norm: the sign is the whole
+    # point (negative => the prior is inflating the sampled weight noise,
+    # positive => it is shrinking it), and a norm would discard it.
+    n_entries = max(sum(int(p.mu.size) for p in new_params), 1)
+    kl_log_sigma_grad = sum(
+        (jnp.sum(g.log_sigma) for g in kl_grads), jnp.asarray(0.0, dtype=DTYPE)
+    ) / jnp.asarray(n_entries, dtype=DTYPE)
+    return VBPCDiagnostics(
+        pc_energy=l_pc,
+        weight_kl=l_kl,
+        total_loss=total,
+        mean_weight_variance=mean_weight_variance(
+            new_params, cfg.weight_sigma_min, cfg.weight_sigma_max
+        ),
+        beta=beta,
+        eps_norm=eps_norm,
+        latent_energy_init=latent_diag.init_energy,
+        latent_energy_final=latent_diag.final_energy,
+        latent_grad_norm_init=latent_diag.init_grad_norm,
+        latent_grad_norm_final=latent_diag.final_grad_norm,
+        latent_sigma_mean_final=latent_diag.sigma_mean_per_step[-1],
+        pc_grad_norm=pc_grad_norm,
+        kl_grad_norm=kl_grad_norm,
+        kl_grad_share=kl_grad_share,
+        kl_log_sigma_grad=kl_log_sigma_grad,
+    )
+
+
+def vbpc_train_step(
+    cfg: VBPCConfig,
+    layer_dims: Tuple[int, ...],
+    weight_params: Tuple[VBPCWeightParams, ...],
+    opt_state: Any,
+    xb: Array,
+    yb: Array,
+    key: Array,
+    optimizer: VBPCOptimizer,
+    beta: Optional[Array] = None,
+) -> Tuple[Tuple[VBPCWeightParams, ...], Any, VBPCDiagnostics]:
+    """One VBPC step: latent inference on ``L_PC`` then an Adam step on ``L_total``."""
+
+    beta_value = resolve_beta(cfg, beta)
+    total, terms, grads, _, latent_diag, epsilons, kl_grads = vbpc_loss_and_grads(
+        cfg, layer_dims, weight_params, xb, yb, key, beta_value
+    )
+    new_params, new_opt_state = optimizer.update(weight_params, grads, opt_state)
+    diag = build_step_diagnostics(
+        cfg, new_params, terms, total, latent_diag, epsilons, beta_value, grads, kl_grads
+    )
+    return new_params, new_opt_state, diag
+
+
+def make_vbpc_train_step(
+    cfg: VBPCConfig,
+    layer_dims: Tuple[int, ...],
+    optimizer: Optional[VBPCOptimizer] = None,
+):
+    """Build the JIT-compiled VBPC step used by the trainer.
+
+    Returns ``(train_step, optimizer)``; the optimizer keeps its Adam moments in
+    ``opt_state`` across steps, so the returned instance must be reused for the
+    whole run.
+    """
+
+    optimizer = optimizer if optimizer is not None else make_optimizer(cfg.weight_lr, cfg.weight_grad_clip)
+
+    @jax.jit
+    def train_step(weight_params, opt_state, xb, yb, key, beta):
+        return vbpc_train_step(
+            cfg, layer_dims, weight_params, opt_state, xb, yb, key, optimizer, beta
+        )
+
+    return train_step, optimizer
